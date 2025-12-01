@@ -1,187 +1,182 @@
 from flask import Flask, request, jsonify
 import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask_bcrypt import Bcrypt
 import jwt
 import datetime
-import os
 from functools import wraps
-from psycopg2.extras import RealDictCursor # Используем для получения данных в виде словарей
-
-# =========================================================================
-# 1. КОНФИГУРАЦИЯ
-# =========================================================================
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'default_super_secure_key_12345') 
+app.config['SECRET_KEY'] = 'my_secret_key_123'  # В продакшене замените на сложный ключ
 bcrypt = Bcrypt(app)
 
-# Настройка подключения к PostgreSQL
+# Настройки подключения к БД
 DB_CONFIG = {
     "host": "localhost",
-    "database": "myapp_db", 
+    "database": "Travel_agency",  # Ваша БД
     "user": "postgres",
-    "password": "ВАШ_ПАРОЛЬ" # !!! ЗАМЕНИТЕ ВАШ ПАРОЛЬ !!!
+    "password": "0000"            # Ваш пароль
 }
 
-# Разрешенные таблицы для маршрута /data/load
-ALLOWED_TABLES = ['clients', 'tours', 'contracts', 'users'] 
-# Ваше приложение использует базу данных 'Travel_agency', 
-# но в настройках мы используем 'myapp_db'. 
-# Для работы сервера убедитесь, что 'myapp_db' существует и имеет нужные таблицы.
-
-# =========================================================================
-# 2. ФУНКЦИИ БАЗЫ ДАННЫХ
-# =========================================================================
+# --- Вспомогательные функции ---
 
 def get_db_connection():
-    """Возвращает соединение с базой данных, используя RealDictCursor для получения словарей."""
-    conn = psycopg2.connect(**DB_CONFIG)
-    return conn
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        return conn
+    except Exception as e:
+        print(f"Db connection error: {e}")
+        return None
 
-# =========================================================================
-# 3. АУТЕНТИФИКАЦИЯ И ТОКЕНЫ
-# =========================================================================
+def init_db():
+    """Создает таблицу пользователей для приложения, если её нет"""
+    conn = get_db_connection()
+    if conn:
+        cur = conn.cursor()
+        # Создаем таблицу пользователей приложения
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS app_users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(100) UNIQUE NOT NULL,
+                password_hash VARCHAR(200) NOT NULL,
+                role VARCHAR(20) DEFAULT 'user'
+            );
+        """)
+        # Создаем дефолтного админа (пароль 12345)
+        # Хеш сгенерирован для '12345'
+        default_hash = bcrypt.generate_password_hash('12345').decode('utf-8')
+        cur.execute("INSERT INTO app_users (username, password_hash, role) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING", 
+                    ('admin', default_hash, 'admin'))
+        conn.commit()
+        cur.close()
+        conn.close()
 
+# Инициализируем БД при старте
+init_db()
+
+# --- Декоратор авторизации ---
 def token_required(f):
-    """Декоратор для проверки JWT токена."""
     @wraps(f)
     def decorated(*args, **kwargs):
         token = None
         if 'Authorization' in request.headers:
-            token = request.headers['Authorization'].split(" ")[1]
-
+            # Ожидаем заголовок "Bearer <token>"
+            auth_header = request.headers['Authorization']
+            if auth_header.startswith("Bearer "):
+                token = auth_header.split(" ")[1]
+        
         if not token:
             return jsonify({'message': 'Token is missing!'}), 401
-
+        
         try:
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
-            kwargs['current_user_data'] = data 
-        except Exception as e:
-            return jsonify({'message': f'Token is invalid: {str(e)}'}), 401
-
+            # Можно добавить проверку существования пользователя в БД
+        except:
+            return jsonify({'message': 'Token is invalid!'}), 401
+            
         return f(*args, **kwargs)
-
     return decorated
+
+# --- Маршруты ---
 
 @app.route('/register', methods=['POST'])
 def register():
-    """Обрабатывает регистрацию нового пользователя."""
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
 
     if not username or not password:
-        return jsonify({"message": "Missing username or password"}), 400
+        return jsonify({"message": "Missing data"}), 400
 
-    password_hash = bcrypt.generate_password_hash(password).decode('utf-8')
+    hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
 
-    conn = None
+    conn = get_db_connection()
+    if not conn: return jsonify({"message": "DB Error"}), 500
+    
     try:
-        conn = get_db_connection()
         cur = conn.cursor()
-        
-        # Новый пользователь получает роль 'user' по умолчанию
-        cur.execute("INSERT INTO users (username, password_hash, role) VALUES (%s, %s, 'user')",
-                    (username, password_hash))
-        
+        cur.execute("INSERT INTO app_users (username, password_hash, role) VALUES (%s, %s, 'user')", 
+                    (username, hashed_password))
         conn.commit()
         cur.close()
-        
-        return jsonify({"message": f"User {username} registered successfully. You can now log in."}), 201
-
+        return jsonify({"message": "User created successfully"}), 201
     except psycopg2.errors.UniqueViolation:
         conn.rollback()
-        return jsonify({"message": "Username already taken"}), 409
-        
+        return jsonify({"message": "Username already exists"}), 409
     except Exception as e:
-        if conn: conn.rollback()
-        return jsonify({"message": f"Database error: {str(e)}"}), 500
+        return jsonify({"message": str(e)}), 500
     finally:
-        if conn: conn.close()
-
+        conn.close()
 
 @app.route('/login', methods=['POST'])
 def login():
-    """Обрабатывает вход пользователя и возвращает JWT токен и роль."""
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
+
+    conn = get_db_connection()
+    if not conn: return jsonify({"message": "DB Error"}), 500
+
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT * FROM app_users WHERE username = %s", (username,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if user and bcrypt.check_password_hash(user['password_hash'], password):
+        token = jwt.encode({
+            'user': user['username'],
+            'role': user['role'],
+            'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+        }, app.config['SECRET_KEY'], algorithm="HS256")
+        
+        return jsonify({'token': token, 'role': user['role']})
     
-    if not username or not password:
-        return jsonify({"message": "Missing username or password"}), 400
-        
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        cur.execute("SELECT id, password_hash, role FROM users WHERE username = %s", (username,))
-        user_record = cur.fetchone()
-        cur.close()
-        conn.close()
+    return jsonify({'message': 'Invalid credentials'}), 401
 
-        if user_record is None:
-            return jsonify({"message": "Invalid credentials"}), 401
-
-        user_id, stored_hash, user_role = user_record
-        
-        if bcrypt.check_password_hash(stored_hash, password):
-            token_payload = {
-                'user_id': user_id,
-                'role': user_role,
-                'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24),
-                'iat': datetime.datetime.utcnow()
-            }
-            token = jwt.encode(token_payload, app.config['SECRET_KEY'], algorithm='HS256')
-            
-            return jsonify({
-                "message": "Login successful",
-                "token": token,
-                "role": user_role
-            }), 200
-        else:
-            return jsonify({"message": "Invalid credentials"}), 401
-
-    except Exception as e:
-        if conn: conn.close()
-        return jsonify({"message": f"Server error: {str(e)}"}), 500
-
-# =========================================================================
-# 4. МАРШРУТЫ ДЛЯ ДАННЫХ (CRUD)
-# =========================================================================
-
-# Маршрут для загрузки данных из таблицы, используемый BaseForm.LoadData
-@app.route('/data/load/<string:table_name>', methods=['GET'])
+@app.route('/data/load/<table_name>', methods=['GET'])
 @token_required
-def load_data(table_name, current_user_data):
-    """Загружает все данные из указанной таблицы."""
+def load_data(table_name):
+    # Белый список таблиц для безопасности
+    ALLOWED_TABLES = ['client', 'tour', 'booking', 'hotel', 'transport', 'country', 'city']
+    
     if table_name not in ALLOWED_TABLES:
-        return jsonify({"message": f"Table '{table_name}' access denied or does not exist."}), 403
+        return jsonify({'message': 'Table not allowed'}), 403
 
-    conn = None
+    conn = get_db_connection()
+    if not conn: return jsonify({"message": "DB Error"}), 500
+
     try:
-        # Используем RealDictCursor для получения данных в виде списка словарей (JSON)
-        conn = psycopg2.connect(**DB_CONFIG)
-        cur = conn.cursor(cursor_factory=RealDictCursor) 
-        
-        query = f"SELECT * FROM {table_name} ORDER BY 1"
-        cur.execute(query)
-        records = cur.fetchall()
-        
+        # Используем RealDictCursor, чтобы получить JSON-совместимый словарь
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(f"SELECT * FROM {table_name} ORDER BY 1") # ORDER BY 1 для сортировки по ID
+        rows = cur.fetchall()
         cur.close()
-        conn.close()
-        
-        return jsonify(records), 200
-
+        return jsonify(rows) # Flask автоматически преобразует список словарей в JSON
     except Exception as e:
-        if conn: conn.close()
-        # Если таблица существует в ALLOWED_TABLES, но отсутствует в БД, будет ошибка
-        return jsonify({"message": f"Database query error: {str(e)}"}), 500
+        return jsonify({'message': str(e)}), 500
+    finally:
+        conn.close()
 
-# =========================================================================
-# 5. ЗАПУСК
-# =========================================================================
+# Заглушка для удаления (нужно реализовать в C# вызов этого API)
+@app.route('/data/delete/<table_name>/<id>', methods=['DELETE'])
+@token_required
+def delete_data(table_name, id):
+    ALLOWED_TABLES = ['client', 'tour', 'booking', 'hotel', 'transport', 'country', 'city']
+    if table_name not in ALLOWED_TABLES: return jsonify({'message': 'Table not allowed'}), 403
+    
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        # Внимание: SQL-инъекция возможна, если id не число. В продакшене проверять тип!
+        cur.execute(f"DELETE FROM {table_name} WHERE id = %s", (id,)) 
+        conn.commit()
+        cur.close()
+        return jsonify({'message': 'Deleted'})
+    except Exception as e:
+        return jsonify({'message': str(e)}), 500
+    finally:
+        conn.close()
 
 if __name__ == '__main__':
-    print("Running Flask app on http://127.0.0.1:5000/")
-    app.run(debug=True, port=5000)
+    app.run(host='0.0.0.0', port=5000, debug=True)
